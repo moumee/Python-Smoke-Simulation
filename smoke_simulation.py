@@ -2,11 +2,9 @@ import pygame
 import random
 import math
 
-# Constants
 WIDTH, HEIGHT = 1000, 700
 FPS = 60
 
-# Colors
 BACKGROUND_COLOR = (30, 30, 30)
 UI_BG_COLOR = (50, 50, 50)
 SMOKE_COLOR = (200, 200, 200)
@@ -17,15 +15,18 @@ OBSTACLE_COLOR = (100, 100, 150)
 
 class SimulationParams:
     def __init__(self):
-        self.gravity = 0.05   # Constant Gravity (Down)
-        self.buoyancy = 0.10  # Buoyancy Force (Up)
+        self.gravity = 0.05
+        self.buoyancy = 0.10
         self.wind = 0.0
         self.drag = 0.99
         self.particle_size = 4.0
         self.emission_rate = 5
-        self.life_decay = 2.0
+        self.particle_lifetime = 3.0
         self.show_grid = False
         self.turbulence_strength = 0.5
+        
+        self.noise_scale = 0.005
+        self.use_rk4 = True
         self.time = 0
 
 params = SimulationParams()
@@ -40,29 +41,42 @@ class VectorGrid:
         self.cell_h = height // rows
         self.vectors = [[(0, 0) for _ in range(cols)] for _ in range(rows)]
     
+    def get_potential(self, x, y, time):
+        val = 0
+        scale = params.noise_scale
+        
+        val += math.sin(x * scale + time) + math.cos(y * scale + time)
+        val += 0.5 * (math.sin(x * scale * 2.0 + time * 1.5) + math.cos(y * scale * 2.0 + time * 1.5))
+        val += 0.25 * (math.sin(x * scale * 4.0 + time * 2.0) + math.cos(y * scale * 4.0 + time * 2.0))
+        
+        return val
+
+    def compute_curl(self, x, y, time):
+        epsilon = 1.0 
+        
+        n_up = self.get_potential(x, y - epsilon, time)
+        n_down = self.get_potential(x, y + epsilon, time)
+        dy = (n_down - n_up) / (2 * epsilon)
+        
+        n_left = self.get_potential(x - epsilon, y, time)
+        n_right = self.get_potential(x + epsilon, y, time)
+        dx = (n_right - n_left) / (2 * epsilon)
+        
+        return dy, -dx
+
     def update(self, time):
-        # Generate a flow field using simple trig functions (pseudo-noise)
-        scale = 0.1
         for r in range(self.rows):
             for c in range(self.cols):
-                # Map grid position to noise space
-                x = c * scale
-                y = r * scale
-                # Simple swirling pattern
-                angle = math.sin(x + time * 0.5) + math.cos(y + time * 0.5) * 2.0
-                # Add some variation
-                angle += math.sin(y * 3.0 + time) * 0.5
+                cx = c * self.cell_w + self.cell_w // 2
+                cy = r * self.cell_h + self.cell_h // 2
                 
-                vx = math.cos(angle)
-                vy = math.sin(angle)
+                vx, vy = self.compute_curl(cx, cy, time)
+                
                 self.vectors[r][c] = (vx, vy)
 
-    def get_force(self, x, y):
-        c = int(x // self.cell_w)
-        r = int(y // self.cell_h)
-        if 0 <= r < self.rows and 0 <= c < self.cols:
-            return self.vectors[r][c]
-        return (0, 0)
+    def get_force(self, x, y, time=None):
+        if time is None: time = params.time
+        return self.compute_curl(x, y, time)
 
     def draw(self, surface):
         for r in range(self.rows):
@@ -71,12 +85,13 @@ class VectorGrid:
                 cy = r * self.cell_h + self.cell_h // 2
                 vx, vy = self.vectors[r][c]
                 
-                # Draw arrow
-                end_x = cx + vx * 10
-                end_y = cy + vy * 10
-                color = (60, 60, 60)
+                vis_scale = 300.0
+                end_x = cx + vx * vis_scale
+                end_y = cy + vy * vis_scale
+                
+                color = (80, 80, 80)
                 pygame.draw.line(surface, color, (cx, cy), (end_x, end_y), 1)
-                pygame.draw.circle(surface, color, (int(end_x), int(end_y)), 2)
+                pygame.draw.circle(surface, (100, 100, 100), (cx, cy), 2)
 
 class Slider:
     def __init__(self, x, y, w, h, min_val, max_val, initial_val, label):
@@ -170,12 +185,11 @@ class Obstacle:
 
     def draw(self, surface):
         pygame.draw.circle(surface, OBSTACLE_COLOR, (int(self.x), int(self.y)), self.radius)
-        # Draw border
         pygame.draw.circle(surface, (200, 200, 250), (int(self.x), int(self.y)), self.radius, 2)
 
     def handle_event(self, event):
         if event.type == pygame.MOUSEBUTTONDOWN:
-            if event.button == 1: # Left click
+            if event.button == 1:
                 dist = math.hypot(event.pos[0] - self.x, event.pos[1] - self.y)
                 if dist < self.radius:
                     self.dragging = True
@@ -196,7 +210,11 @@ class Particle:
         self.ax = 0
         self.ay = 0
         self.life = 255.0
-        self.decay = random.uniform(params.life_decay * 0.8, params.life_decay * 1.2)
+        
+        lifetime_frames = params.particle_lifetime * FPS
+        base_decay = 255.0 / max(1, lifetime_frames)
+        self.decay = random.uniform(base_decay * 0.8, base_decay * 1.2)
+        
         self.radius = random.uniform(params.particle_size, params.particle_size * 1.5)
         self.growth = 0.05
 
@@ -205,58 +223,74 @@ class Particle:
         self.ay += fy
 
     def update(self, obstacles, vector_grid):
-        # 1. Gravity (Down)
         self.apply_force(0, params.gravity)
         
-        # 2. Buoyancy (Up)
         self.apply_force(0, -params.buoyancy)
 
-        # 3. Wind / Vector Field
-        # Global wind
         wind_variation = random.uniform(-0.005, 0.005)
         self.apply_force(params.wind + wind_variation, 0)
         
-        # Grid Turbulence
         if params.turbulence_strength > 0:
-            grid_fx, grid_fy = vector_grid.get_force(self.x, self.y)
-            self.apply_force(grid_fx * params.turbulence_strength * 0.1, grid_fy * params.turbulence_strength * 0.1)
+            if params.use_rk4:
+                dt = 1.0 
+                dt_time = 0.01 
+                
+                k1x, k1y = vector_grid.get_force(self.x, self.y, params.time)
+                
+                k2x, k2y = vector_grid.get_force(
+                    self.x + self.vx * 0.5 * dt, 
+                    self.y + self.vy * 0.5 * dt, 
+                    params.time + 0.5 * dt_time
+                )
+                
+                k3x, k3y = vector_grid.get_force(
+                    self.x + self.vx * 0.5 * dt, 
+                    self.y + self.vy * 0.5 * dt, 
+                    params.time + 0.5 * dt_time
+                )
+                
+                k4x, k4y = vector_grid.get_force(
+                    self.x + self.vx * dt, 
+                    self.y + self.vy * dt, 
+                    params.time + dt_time
+                )
+                
+                avg_fx = (k1x + 2*k2x + 2*k3x + k4x) / 6.0
+                avg_fy = (k1y + 2*k2y + 2*k3y + k4y) / 6.0
+                
+                self.apply_force(avg_fx * params.turbulence_strength, avg_fy * params.turbulence_strength)
+                
+            else:
+                curl_x, curl_y = vector_grid.get_force(self.x, self.y, params.time)
+                self.apply_force(curl_x * params.turbulence_strength, curl_y * params.turbulence_strength)
         
         self.vx += self.ax
         self.vy += self.ay
         self.vx *= params.drag
         self.vy *= params.drag
         
-        # Proposed new position
         next_x = self.x + self.vx
         next_y = self.y + self.vy
 
-        # Collision Detection & Response with Obstacles
         for obs in obstacles:
             dx = next_x - obs.x
             dy = next_y - obs.y
             dist = math.hypot(dx, dy)
             
-            # Simple collision check
             min_dist = obs.radius + self.radius * 0.5 
             
             if dist < min_dist:
-                # Collision detected!
-                # Calculate normal vector
                 nx = dx / dist
                 ny = dy / dist
                 
-                # Push particle out
                 overlap = min_dist - dist
                 next_x += nx * overlap
                 next_y += ny * overlap
                 
-                # Reflect velocity (Bounce)
-                # v_new = v - 2 * (v . n) * n
                 dot = self.vx * nx + self.vy * ny
                 self.vx -= 2 * dot * nx
                 self.vy -= 2 * dot * ny
                 
-                # Dampen the bounce
                 self.vx *= 0.5
                 self.vy *= 0.5
 
@@ -275,9 +309,6 @@ class Particle:
 
         temp_surface = pygame.Surface((radius_int * 2, radius_int * 2), pygame.SRCALPHA)
         alpha = int(max(0, min(255, self.life)))
-        
-        temp_surface = pygame.Surface((radius_int * 2, radius_int * 2), pygame.SRCALPHA)
-        alpha = int(max(0, min(255, self.life)))
         color = (*SMOKE_COLOR, alpha)
 
         pygame.draw.circle(temp_surface, color, (radius_int, radius_int), radius_int)
@@ -289,19 +320,17 @@ class Particle:
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Smoke Physics Engine")
+    pygame.display.set_caption("Smoke Physics Engine - Curl Noise")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 16)
 
     particles = []
     
-    # Obstacles Setup
     obstacles = [
         Obstacle(WIDTH // 2 + 150, HEIGHT // 2, 60),
         Obstacle(WIDTH // 2 + 250, HEIGHT // 2 - 100, 40)
     ]
 
-    # Vector Grid
     vector_grid = VectorGrid(20, 20, WIDTH, HEIGHT)
 
     sliders = [
@@ -310,12 +339,14 @@ def main():
         Slider(50, 150, 200, 10, 0.90, 0.999, params.drag, "Air Resistance (Drag)"),
         Slider(50, 200, 200, 10, 1.0, 10.0, params.particle_size, "Initial Size"),
         Slider(50, 250, 200, 10, 1, 20, params.emission_rate, "Emission Rate"),
-        Slider(50, 300, 200, 10, 0.5, 5.0, params.life_decay, "Decay Rate (Life)"),
-        Slider(50, 350, 200, 10, 0.0, 2.0, params.turbulence_strength, "Turbulence (Grid)")
+        Slider(50, 300, 200, 10, 1.0, 10.0, params.particle_lifetime, "Particle Lifetime (s)"),
+        Slider(50, 350, 200, 10, 0.0, 5.0, params.turbulence_strength, "Turbulence (Curl)"),
+        Slider(50, 400, 200, 10, 0.001, 0.02, params.noise_scale, "Noise Scale (Zoom)")
     ]
 
     buttons = [
-        ToggleButton(50, 400, 200, 40, "Show Grid", lambda: params.show_grid, lambda x: setattr(params, 'show_grid', x))
+        ToggleButton(50, 450, 200, 40, "Show Grid", lambda: params.show_grid, lambda x: setattr(params, 'show_grid', x)),
+        ToggleButton(50, 500, 200, 40, "Integrator: RK4", lambda: params.use_rk4, lambda x: setattr(params, 'use_rk4', x))
     ]
 
     running = True
@@ -333,6 +364,8 @@ def main():
             
             for btn in buttons:
                 btn.handle_event(event)
+                if btn.text.startswith("Integrator"):
+                    btn.text = f"Integrator: {'RK4' if params.use_rk4 else 'Euler'}"
             
             for obs in obstacles:
                 obs.handle_event(event)
@@ -349,15 +382,14 @@ def main():
         params.drag = sliders[2].val
         params.particle_size = sliders[3].val
         params.emission_rate = int(sliders[4].val)
-        params.life_decay = sliders[5].val
+        params.particle_lifetime = sliders[5].val
         params.turbulence_strength = sliders[6].val
+        params.noise_scale = sliders[7].val
 
-        # Emitter
         mouse_pos = pygame.mouse.get_pos()
         should_emit = False
         emit_pos = (WIDTH // 2 + 150, HEIGHT - 50)
 
-        # Check if mouse is interacting with obstacles
         interacting_with_obstacle = any(obs.dragging for obs in obstacles)
 
         if pygame.mouse.get_pressed()[0] and not interacting_with_obstacle:
@@ -371,19 +403,16 @@ def main():
             for _ in range(params.emission_rate):
                 particles.append(Particle(emit_pos[0], emit_pos[1]))
 
-        # Update Particles
         for i in range(len(particles) - 1, -1, -1):
             p = particles[i]
-            p.update(obstacles, vector_grid) # Pass obstacles and grid
+            p.update(obstacles, vector_grid)
             p.draw(screen)
             if p.is_dead():
                 particles.pop(i)
 
-        # Draw Obstacles
         for obs in obstacles:
             obs.draw(screen)
 
-        # Draw GUI
         if params.show_grid:
             vector_grid.draw(screen)
 
