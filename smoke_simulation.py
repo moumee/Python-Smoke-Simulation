@@ -20,16 +20,74 @@ class SimulationParams:
         self.wind = 0.0
         self.drag = 0.99
         self.particle_size = 4.0
-        self.emission_rate = 5
-        self.particle_lifetime = 3.0
+        self.emission_rate = 1
+        self.particle_lifetime = 1.6
         self.show_grid = False
+        self.show_spatial_grid = False
         self.turbulence_strength = 0.5
         
         self.noise_scale = 0.005
         self.use_rk4 = True
         self.time = 0
 
+        self.smoothing_radius = 30.0
+        self.target_density = 1.0
+        self.pressure_multiplier = 0.1
+        self.interaction_radius = 30.0
+
 params = SimulationParams()
+
+class FixedGrid:
+    def __init__(self, width, height, cell_size):
+        self.width = width
+        self.height = height
+        self.cell_size = cell_size
+        self.cols = math.ceil(width / cell_size)
+        self.rows = math.ceil(height / cell_size)
+        self.cells = [[[] for _ in range(self.cols)] for _ in range(self.rows)]
+
+    def clear(self):
+        for r in range(self.rows):
+            for c in range(self.cols):
+                self.cells[r][c].clear()
+
+    def insert(self, particle):
+        cx = int(particle.x / self.cell_size)
+        cy = int(particle.y / self.cell_size)
+        
+        if 0 <= cx < self.cols and 0 <= cy < self.rows:
+            self.cells[cy][cx].append(particle)
+
+    def query(self, x, y, radius):
+        particles = []
+        cx = int(x / self.cell_size)
+        cy = int(y / self.cell_size)
+        
+        for r in range(cy - 1, cy + 2):
+            for c in range(cx - 1, cx + 2):
+                if 0 <= r < self.rows and 0 <= c < self.cols:
+                    for p in self.cells[r][c]:
+                        dx = p.x - x
+                        dy = p.y - y
+                        if dx*dx + dy*dy <= radius*radius:
+                            particles.append(p)
+        return particles
+
+    def draw_grid(self, surface):
+        for c in range(self.cols + 1):
+            x = c * self.cell_size
+            pygame.draw.line(surface, (50, 50, 50), (x, 0), (x, self.height))
+        for r in range(self.rows + 1):
+            y = r * self.cell_size
+            pygame.draw.line(surface, (50, 50, 50), (0, y), (self.width, y))
+        
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if self.cells[r][c]:
+                    rect = (c * self.cell_size, r * self.cell_size, self.cell_size, self.cell_size)
+                    s = pygame.Surface((self.cell_size, self.cell_size), pygame.SRCALPHA)
+                    s.fill((0, 255, 0, 30))
+                    surface.blit(s, rect)
 
 class VectorGrid:
     def __init__(self, rows, cols, width, height):
@@ -85,7 +143,7 @@ class VectorGrid:
                 cy = r * self.cell_h + self.cell_h // 2
                 vx, vy = self.vectors[r][c]
                 
-                vis_scale = 300.0
+                vis_scale = 600.0
                 end_x = cx + vx * vis_scale
                 end_y = cy + vy * vis_scale
                 
@@ -200,31 +258,66 @@ class Obstacle:
                 self.x, self.y = event.pos
 
 class Particle:
+    __slots__ = ('x', 'y', 'vx', 'vy', 'ax', 'ay', 'life', 'decay', 'radius', 'growth', 'density', 'pressure')
+
     def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        angle = random.uniform(0, 2 * math.pi)
-        speed = random.uniform(0.5, 1.5)
-        self.vx = math.cos(angle) * speed
-        self.vy = math.sin(angle) * speed - 1.0
-        self.ax = 0
-        self.ay = 0
-        self.life = 255.0
-        
-        lifetime_frames = params.particle_lifetime * FPS
-        base_decay = 255.0 / max(1, lifetime_frames)
-        self.decay = random.uniform(base_decay * 0.8, base_decay * 1.2)
-        
-        self.radius = random.uniform(params.particle_size, params.particle_size * 1.5)
-        self.growth = 0.05
+        self.reset(x, y)
 
     def apply_force(self, fx, fy):
         self.ax += fx
         self.ay += fy
 
+    def compute_density_pressure(self, spatial_hash):
+        self.density = 0.0
+        neighbors = spatial_hash.query(self.x, self.y, params.smoothing_radius)
+        
+        for neighbor in neighbors:
+            dx = self.x - neighbor.x
+            dy = self.y - neighbor.y
+            dist = math.sqrt(dx*dx + dy*dy)
+            
+            if dist < params.smoothing_radius:
+                q = 1.0 - (dist / params.smoothing_radius)
+                self.density += q * q
+
+        self.density = max(self.density, 0.0001)
+        self.pressure = params.pressure_multiplier * max(0, self.density - params.target_density)
+
+    def compute_pressure_force(self, spatial_hash):
+        fx, fy = 0.0, 0.0
+        neighbors = spatial_hash.query(self.x, self.y, params.smoothing_radius)
+        
+        sr_sq = params.smoothing_radius * params.smoothing_radius
+        
+        for neighbor in neighbors:
+            if neighbor == self: continue
+            
+            dx = self.x - neighbor.x
+            dy = self.y - neighbor.y
+            dist_sq = dx*dx + dy*dy
+            
+            if 0 < dist_sq < sr_sq:
+                dist = math.sqrt(dist_sq)
+                q = 1.0 - (dist / params.smoothing_radius)
+                
+                press_term = (self.pressure + neighbor.pressure) / (2 * neighbor.density)
+                force = -press_term * q
+                
+                fx += (dx / dist) * force
+                fy += (dy / dist) * force
+        
+        max_force = 0.5
+        force_sq = fx*fx + fy*fy
+        if force_sq > max_force*max_force:
+            force_mag = math.sqrt(force_sq)
+            scale = max_force / force_mag
+            fx *= scale
+            fy *= scale
+            
+        self.apply_force(fx, fy)
+
     def update(self, obstacles, vector_grid):
         self.apply_force(0, params.gravity)
-        
         self.apply_force(0, -params.buoyancy)
 
         wind_variation = random.uniform(-0.005, 0.005)
@@ -302,20 +395,68 @@ class Particle:
         self.life -= self.decay
         self.radius += self.growth
 
+    sprite_cache = {}
+
     def draw(self, surface):
-        if self.life > 0 and self.life < 5: return
+        if self.life <= 0: return
+        
         radius_int = int(self.radius)
         if radius_int < 1: return
-
-        temp_surface = pygame.Surface((radius_int * 2, radius_int * 2), pygame.SRCALPHA)
+        
         alpha = int(max(0, min(255, self.life)))
-        color = (*SMOKE_COLOR, alpha)
+        if alpha < 5: return
 
-        pygame.draw.circle(temp_surface, color, (radius_int, radius_int), radius_int)
-        surface.blit(temp_surface, (int(self.x - radius_int), int(self.y - radius_int)))
+        cache_key = (radius_int, alpha)
+        if cache_key not in Particle.sprite_cache:
+            temp_surface = pygame.Surface((radius_int * 2, radius_int * 2), pygame.SRCALPHA)
+            color = (*SMOKE_COLOR, alpha)
+            pygame.draw.circle(temp_surface, color, (radius_int, radius_int), radius_int)
+            Particle.sprite_cache[cache_key] = temp_surface
+        
+        texture = Particle.sprite_cache[cache_key]
+        surface.blit(texture, (int(self.x - radius_int), int(self.y - radius_int)))
+
+    def reset(self, x, y):
+        self.x = x
+        self.y = y
+        angle = random.uniform(0, 2 * math.pi)
+        speed = random.uniform(0.5, 1.5)
+        self.vx = math.cos(angle) * speed
+        self.vy = math.sin(angle) * speed - 1.0
+        self.ax = 0
+        self.ay = 0
+        self.life = 255.0
+        
+        lifetime_frames = params.particle_lifetime * FPS
+        base_decay = 255.0 / max(1, lifetime_frames)
+        self.decay = random.uniform(base_decay * 0.8, base_decay * 1.2)
+        
+        self.radius = random.uniform(params.particle_size, params.particle_size * 1.5)
+        self.growth = 0.05
+        self.density = 0.0
+        self.pressure = 0.0
 
     def is_dead(self):
         return self.life <= 0
+
+class ParticlePool:
+    def __init__(self, size):
+        self.pool = [Particle(0, 0) for _ in range(size)]
+        self.active_particles = []
+
+    def get(self, x, y):
+        if not self.pool:
+            return None
+        
+        p = self.pool.pop()
+        p.reset(x, y)
+        self.active_particles.append(p)
+        return p
+
+    def return_particle(self, p):
+        if p in self.active_particles:
+            self.active_particles.remove(p)
+            self.pool.append(p)
 
 def main():
     pygame.init()
@@ -324,7 +465,8 @@ def main():
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 16)
 
-    particles = []
+    particle_pool = ParticlePool(200)
+    particles = particle_pool.active_particles
     
     obstacles = [
         Obstacle(WIDTH // 2 + 150, HEIGHT // 2, 60),
@@ -332,21 +474,26 @@ def main():
     ]
 
     vector_grid = VectorGrid(20, 20, WIDTH, HEIGHT)
+    spatial_hash = FixedGrid(WIDTH, HEIGHT, params.smoothing_radius)
 
     sliders = [
-        Slider(50, 50, 200, 10, 0.0, 0.2, params.buoyancy, "Buoyancy Force"),
-        Slider(50, 100, 200, 10, -0.1, 0.1, params.wind, "Wind Force"),
-        Slider(50, 150, 200, 10, 0.90, 0.999, params.drag, "Air Resistance (Drag)"),
-        Slider(50, 200, 200, 10, 1.0, 10.0, params.particle_size, "Initial Size"),
-        Slider(50, 250, 200, 10, 1, 20, params.emission_rate, "Emission Rate"),
-        Slider(50, 300, 200, 10, 1.0, 10.0, params.particle_lifetime, "Particle Lifetime (s)"),
-        Slider(50, 350, 200, 10, 0.0, 5.0, params.turbulence_strength, "Turbulence (Curl)"),
-        Slider(50, 400, 200, 10, 0.001, 0.02, params.noise_scale, "Noise Scale (Zoom)")
+        Slider(50, 50, 200, 10, 1.0, 10.0, params.particle_size, "Initial Size"),
+        Slider(50, 90, 200, 10, 0.0, 0.2, params.buoyancy, "Buoyancy Force"),
+        Slider(50, 130, 200, 10, -0.1, 0.1, params.wind, "Wind Force"),
+        Slider(50, 170, 200, 10, 0.90, 0.999, params.drag, "Air Resistance (Drag)"),
+        
+        Slider(50, 230, 200, 10, 0.0, 5.0, params.turbulence_strength, "Turbulence (Curl)"),
+        Slider(50, 270, 200, 10, 0.001, 0.02, params.noise_scale, "Noise Scale (Zoom)"),
+        
+        Slider(50, 330, 200, 10, 10.0, 60.0, params.smoothing_radius, "Smoothing Radius"),
+        Slider(50, 370, 200, 10, 0.1, 10.0, params.target_density, "Target Density"),
+        Slider(50, 410, 200, 10, 0.0, 20.0, params.pressure_multiplier, "Pressure Strength")
     ]
 
     buttons = [
-        ToggleButton(50, 450, 200, 40, "Show Grid", lambda: params.show_grid, lambda x: setattr(params, 'show_grid', x)),
-        ToggleButton(50, 500, 200, 40, "Integrator: RK4", lambda: params.use_rk4, lambda x: setattr(params, 'use_rk4', x))
+        ToggleButton(50, 460, 200, 30, "Show Vector Grid", lambda: params.show_grid, lambda x: setattr(params, 'show_grid', x)),
+        ToggleButton(50, 500, 200, 30, "Show Spatial Grid", lambda: params.show_spatial_grid, lambda x: setattr(params, 'show_spatial_grid', x)),
+        ToggleButton(50, 540, 200, 30, "Integrator: RK4", lambda: params.use_rk4, lambda x: setattr(params, 'use_rk4', x))
     ]
 
     running = True
@@ -366,25 +513,32 @@ def main():
                 btn.handle_event(event)
                 if btn.text.startswith("Integrator"):
                     btn.text = f"Integrator: {'RK4' if params.use_rk4 else 'Euler'}"
+                elif btn.text.startswith("Show Spatial"):
+                    pass
             
             for obs in obstacles:
                 obs.handle_event(event)
             
             if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_g:
-                    params.show_grid = not params.show_grid
+                pass
 
         params.time += 0.01
         vector_grid.update(params.time)
 
-        params.buoyancy = sliders[0].val
-        params.wind = sliders[1].val
-        params.drag = sliders[2].val
-        params.particle_size = sliders[3].val
-        params.emission_rate = int(sliders[4].val)
-        params.particle_lifetime = sliders[5].val
-        params.turbulence_strength = sliders[6].val
-        params.noise_scale = sliders[7].val
+        params.particle_size = sliders[0].val
+        params.buoyancy = sliders[1].val
+        params.wind = sliders[2].val
+        params.drag = sliders[3].val
+        
+        params.turbulence_strength = sliders[4].val
+        params.noise_scale = sliders[5].val
+        
+        params.smoothing_radius = sliders[6].val
+        params.target_density = sliders[7].val
+        params.pressure_multiplier = sliders[8].val
+        
+        if abs(spatial_hash.cell_size - params.smoothing_radius) > 1.0:
+             spatial_hash = FixedGrid(WIDTH, HEIGHT, params.smoothing_radius)
 
         mouse_pos = pygame.mouse.get_pos()
         should_emit = False
@@ -401,20 +555,38 @@ def main():
         
         if should_emit:
             for _ in range(params.emission_rate):
-                particles.append(Particle(emit_pos[0], emit_pos[1]))
+                px = emit_pos[0] + random.uniform(-10, 10)
+                py = emit_pos[1] + random.uniform(-10, 10)
+                p = particle_pool.get(px, py)
+                if p:
+                    p.vx += random.uniform(-0.5, 0.5)
+                    p.vy += random.uniform(-0.5, 0.5)
+
+        spatial_hash.clear()
+        for p in particles:
+            spatial_hash.insert(p)
+            
+        for p in particles:
+            p.compute_density_pressure(spatial_hash)
+            
+        for p in particles:
+            p.compute_pressure_force(spatial_hash)
 
         for i in range(len(particles) - 1, -1, -1):
             p = particles[i]
             p.update(obstacles, vector_grid)
             p.draw(screen)
             if p.is_dead():
-                particles.pop(i)
+                particle_pool.return_particle(p)
 
         for obs in obstacles:
             obs.draw(screen)
 
         if params.show_grid:
             vector_grid.draw(screen)
+            
+        if params.show_spatial_grid:
+            spatial_hash.draw_grid(screen)
 
         for slider in sliders:
             slider.draw(screen, font)
@@ -423,7 +595,7 @@ def main():
             btn.draw(screen, font)
             
         info_text = font.render(f"Particles: {len(particles)} | FPS: {int(clock.get_fps())}", True, TEXT_COLOR)
-        hint_text = font.render("Drag obstacles | Press 'G' to toggle Grid", True, TEXT_COLOR)
+        hint_text = font.render("Drag obstacles", True, TEXT_COLOR)
         screen.blit(info_text, (10, HEIGHT - 30))
         screen.blit(hint_text, (10, HEIGHT - 50))
 
